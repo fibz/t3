@@ -45,6 +45,7 @@
 ### DB Design Decisions (Deferred)
 - [ ] Scan results: keep in `scans` JSONB or separate `scan_results` table?
 - [ ] Multi-instance support (concurrent scan limits in DB)?
+- [ ] Enums vs strings for `role`, `status` fields — Postgres enums faster but harder to migrate; strings more flexible
 - [x] Soft deletes vs hard deletes → **LOCKED: No deletes, records marked inactive only** (decision #12)
 - [x] Blob storage → **LOCKED: AWS S3** (decision #10)
 - [x] Audit log retention → **LOCKED: Postgres partitioned year→quarter, 7yr, hot=2Q, cold=S3** (decision #11)
