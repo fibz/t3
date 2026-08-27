@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Login · T3MP3ST Portal</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="wrap"><main class="auth-shell"><form class="card auth-card" method="POST" action="/login">
+    <div class="auth-brand"><span class="brand-mark">T3</span><span><strong>T3MP3ST</strong><small>Security portal</small></span></div>
+    <p class="eyebrow">Welcome back</p><h1>Sign in to your workspace</h1>
+    <p class="auth-copy">Your assessment history and live scan activity are ready.</p>
+    <label>Username</label>
+    <input name="username" autocomplete="username" required />
+    <label>Password</label>
+    <input name="password" type="password" autocomplete="current-password" required />
+    <label>Company (scan target)</label>
+    <input name="company" placeholder="e.g. example.com" required />
+    <button type="submit">Enter</button>
+    <div class="error-msg"><%= error || '' %></div>
+  </form></main></div>
+</body>
+</html>

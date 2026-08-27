@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=T3MP3ST Portal
+Comment=Launch the self-hosted scanner portal (Docker)
+Exec=bash -c 'cd /home/cchock/projects/t3/portal && docker compose up -d && xdg-open http://localhost:8080/login'
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;Security;
