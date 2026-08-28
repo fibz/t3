@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const scanners = require('./scanners');
 const cveService = require('./cve-service');
 const owaspService = require('./owasp-service');
+const db = require('./db-helpers');
 
 const PORT = process.env.PORT || 8080;
 const DATA = path.join(__dirname, '..', 'data');
@@ -25,12 +26,6 @@ const progress = new Map();
 // Map of connected SSE clients: scanId -> Set(res)
 const sseClients = new Map();
 
-function loadUsers() { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return []; } }
-function saveUsers(u) { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2)); }
-function loadScans() { try { return JSON.parse(fs.readFileSync(SCANS_FILE, 'utf8')); } catch { return []; } }
-function saveScans(s) { fs.writeFileSync(SCANS_FILE, JSON.stringify(s, null, 2)); }
-function loadScheduled() { try { return JSON.parse(fs.readFileSync(SCHEDULED_FILE, 'utf8')); } catch { return []; } }
-function saveScheduled(s) { fs.writeFileSync(SCHEDULED_FILE, JSON.stringify(s, null, 2)); }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 // Generate a temporary password for admin-initiated resets.
 function genTempPassword() { return crypto.randomBytes(6).toString('hex'); }
