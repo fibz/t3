@@ -1,6 +1,6 @@
 # T3MP3ST Portal
 
-Self-hosted red-team scanner web UI built from T3MP3ST's scanner arsenal. Single-process Express backend, multi-page (no SPA), file-based persistence.
+Self-hosted scanner web UI built from T3MP3ST's scanner arsenal. Single-process Express backend, multi-page (no SPA), file-based JSON persistence.
 
 ## Features
 
@@ -10,7 +10,8 @@ Self-hosted red-team scanner web UI built from T3MP3ST's scanner arsenal. Single
 - **Scheduling**: Cron-based automated scans with concurrency control (max 2 parallel)
 - **Theming**: Dark/light mode with CSS custom properties, persists in localStorage
 - **Reports**: Printable/PDF scan reports
-- **No Database**: JSON file storage (`users.json`, `scans.json`, `scheduled-scans.json`)
+- **Approved target gate**: admins set exact FQDN/IP targets per user; the server denies scans and schedules outside that scope
+- **JSON persistence**: `users.json`, `scans.json`, and `scheduled-scans.json` are the active persistence path
 
 ## Quick Start
 
@@ -23,6 +24,10 @@ npm start          # Production: PM2 via ecosystem.config.js
 ```
 
 First visit → `/register` (open mode, first user becomes admin) → `/login` → `/dashboard`
+
+### Approved targets
+
+After recovery or first registration, the administrator must open **Administration** and add each user's exact approved FQDN or IP address before any scan can run. Existing users intentionally start with no approved targets, so they are default-denied until this is completed. The active portal reads and writes only the JSON files under `data/`; the Knex/SQLite files are unfinished migration material and are not part of the running request path.
 
 ## Project Structure
 
@@ -126,6 +131,7 @@ portal/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP port |
+| `HOST` | `127.0.0.1` | Bind address; set explicitly only for a trusted network deployment |
 | `SESSION_SECRET` | random 32 bytes | Cookie signing secret |
 | `NODE_ENV` | `development` | `production` enables PM2 config |
 
@@ -143,7 +149,8 @@ pm2 startup
 
 ## Security Notes
 
-- No scope enforcement — scanner runs whatever target is supplied (by design for red-team use)
+- The backend requires an explicit authorization acknowledgement and exact administrator-approved FQDN/IP target before it queues either an immediate or scheduled scan. Empty scope denies scanning.
+- Scheduled scans are re-checked against the current approved target list before execution; an invalidated schedule is disabled rather than run.
 - Passwords bcrypt-hashed (cost 10)
 - Sessions: HttpOnly, SameSite=Lax, 8-hour maxAge
 - Admin-only endpoints guarded by `requireAdmin` middleware

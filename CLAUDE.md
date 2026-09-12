@@ -7,7 +7,7 @@ Self-hosted red-team scanner web UI. Express.js single-process backend, multi-pa
 
 | Decision | Rationale |
 |----------|-----------|
-| No database | Simple deployment, JSON files suffice for single-instance |
+| JSON persistence | Simple deployment, JSON files suffice for this single-instance portal |
 | SSE not WebSockets | Simpler, works over HTTP/1.1, auto-reconnect, no extra deps |
 | Server-rendered HTML | No build step, works without JS, easy to modify |
 | Session cookies (express-session) | No JWT complexity, HttpOnly secure by default |
@@ -33,6 +33,7 @@ ecosystem.config.js # PM2 production config
 - `runScan(id, host, username, scheduledScanId)` — executes 8 modules sequentially, emits SSE progress
 - `emitProgress(id, step, status)` — updates in-memory Map + pushes to SSE clients
 - `loadUsers/saveUsers`, `loadScans/saveScans`, `loadScheduled/saveScheduled` — file I/O
+- `src/scope.js` — exact approved FQDN/IP target normalization and server-side scope checks
 - `render*` functions — server-side HTML templates (all in server.js)
 
 ## Auth Model
@@ -40,6 +41,7 @@ ecosystem.config.js # PM2 production config
 - Login: `username` + `password` + `company` (company becomes default scan target)
 - Session: `{ username, company, email, serverIp, role }`
 - Roles: `admin` (full access) / `operator` (own scans + scheduled only)
+- Admins set each user's `approvedTargets`; scans and schedules are default-deny until a target is approved and the requester confirms authorization.
 - First registered user → `admin` (open mode)
 - Registration disabled once users exist
 

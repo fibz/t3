@@ -1,7 +1,7 @@
 // T3MP3ST Portal — single-process Express backend, multi-page (no SPA).
 // Login: username + password + company. Company becomes the scan target.
 // Auth: local bcrypt users with roles (admin/operator), session cookies.
-// No scope gate — scanner runs whatever target is supplied (by design).
+// Customer scope is enforced on the server before a scan can be queued.
 
 const express = require('express');
 const session = require('express-session');
@@ -12,14 +12,38 @@ const crypto = require('crypto');
 const scanners = require('./scanners');
 const cveService = require('./cve-service');
 const owaspService = require('./owasp-service');
-const db = require('./db-helpers');
+const { normalizeTarget, normalizeApprovedTargets, isApprovedTarget } = require('./scope');
+const { createAssessmentSummary } = require('./report-summary');
 
 const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '127.0.0.1';
 const DATA = path.join(__dirname, '..', 'data');
 const PUBLIC = path.join(__dirname, '..', 'public');
 const USERS_FILE = path.join(DATA, 'users.json');
 const SCANS_FILE = path.join(DATA, 'scans.json');
 const SCHEDULED_FILE = path.join(DATA, 'scheduled-scans.json');
+
+// The active single-instance persistence path. Keep all portal state in the
+// existing JSON files until a complete, tested migration replaces it.
+function loadJson(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(value) ? value : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveJson(file, value) {
+  fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n');
+}
+
+function loadUsers() { return loadJson(USERS_FILE); }
+function saveUsers(users) { saveJson(USERS_FILE, users); }
+function loadScans() { return loadJson(SCANS_FILE); }
+function saveScans(scans) { saveJson(SCANS_FILE, scans); }
+function loadScheduled() { return loadJson(SCHEDULED_FILE); }
+function saveScheduled(scheduled) { saveJson(SCHEDULED_FILE, scheduled); }
 
 // In-memory progress tracker for live SSE updates (keyed by scan id).
 const progress = new Map();
@@ -29,6 +53,15 @@ const sseClients = new Map();
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 // Generate a temporary password for admin-initiated resets.
 function genTempPassword() { return crypto.randomBytes(6).toString('hex'); }
+
+function getUser(username) {
+  return loadUsers().find(user => user.username === username);
+}
+
+function targetIsApprovedForUser(username, target) {
+  const user = getUser(username);
+  return Boolean(user && isApprovedTarget(target, user.approvedTargets));
+}
 
 const SCAN_STEPS = ['dns', 'subdomains', 'ports', 'cve', 'headers', 'ssl', 'robots', 'whois', 'nmap', 'owasp'];
 
@@ -155,11 +188,18 @@ setInterval(() => {
     if (cronMatches(s.cron, now)) {
       // Check if already run this minute (avoid duplicate runs)
       if (s.lastRun && Math.abs(s.lastRun - now.getTime()) < 60000) return;
+      // Re-check scope at execution time: a schedule must never outlive a
+      // later scope change or run without its recorded acknowledgement.
+      if (!s.authorizationConfirmed || !targetIsApprovedForUser(s.username, s.target)) {
+        s.enabled = false;
+        saveScheduled(scheduled);
+        return;
+      }
       const id = crypto.randomUUID();
       scanQueue.push({ id, host: s.target, user: s.username, scheduledScanId: s.id, status: 'waiting' });
       // Create scan record immediately so user sees it
       const scans = loadScans();
-      scans.unshift({ id, user: s.username, company: s.company, target: s.target, startedAt: Date.now(), status: 'queued', results: null, scheduledScanId: s.id });
+      scans.unshift({ id, user: s.username, company: s.company, target: s.target, startedAt: Date.now(), status: 'queued', results: null, scheduledScanId: s.id, scopeTarget: s.target, authorizationConfirmedAt: s.authorizationConfirmedAt || null });
       saveScans(scans);
     }
   });
@@ -238,6 +278,7 @@ app.post('/register', async (req, res) => {
     email,
     company,
     serverIp: serverIp || '',
+    approvedTargets: [],
     role: isFirst ? 'admin' : 'operator',
     enabled: true
   });
@@ -286,11 +327,17 @@ app.get('/scan/:id/stream', requireAuth, (req, res) => {
 // ── scan API (form POST, then redirect to results) ─────────────────────
 app.post('/scan', requireAuth, async (req, res) => {
   const target = (req.body.target || req.session.user.company || '').trim();
-  if (!target) return res.redirect('/dashboard');
-  const host = target.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const host = normalizeTarget(target);
+  if (!host) return res.status(422).send(renderError('Enter one valid FQDN or IP address.'));
+  if (req.body.authorizationConfirmed !== 'on') {
+    return res.status(403).send(renderError('Confirm that you are authorized to scan this approved target.'));
+  }
+  if (!targetIsApprovedForUser(req.session.user.username, host)) {
+    return res.status(403).send(renderError('This target is not in your approved scan scope. Ask an administrator to add it before scanning.'));
+  }
   const id = crypto.randomUUID();
   const scans = loadScans();
-  scans.unshift({ id, user: req.session.user.username, company: req.session.user.company, target: host, startedAt: Date.now(), status: 'queued', results: null });
+  scans.unshift({ id, user: req.session.user.username, company: req.session.user.company, target: host, startedAt: Date.now(), status: 'queued', results: null, scopeTarget: host, authorizationConfirmedAt: new Date().toISOString() });
   saveScans(scans);
   res.redirect('/scan/' + id);
   scanQueue.push({ id, host, user: req.session.user.username, scheduledScanId: null, status: 'waiting' });
@@ -330,6 +377,17 @@ app.post('/admin/:username/reset-password', requireAuth, requireAdmin, (req, res
   // Show temp password once via flash - simplified: render admin with temp shown
   res.send(renderAdmin(req.session.user, users, { resetMsg: `Password reset for ${u.username}: ${temp}` }));
 });
+app.post('/admin/:username/approved-targets', requireAuth, requireAdmin, (req, res) => {
+  const users = loadUsers();
+  const targetUser = users.find(u => u.username === req.params.username);
+  if (!targetUser) return res.redirect('/admin');
+  const entries = String(req.body.approvedTargets || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  const { targets, error } = normalizeApprovedTargets(entries);
+  if (error) return res.status(422).send(renderError(error));
+  targetUser.approvedTargets = targets;
+  saveUsers(users);
+  res.redirect('/admin');
+});
 
 // ── admin: scheduled scans management ──────────────────────────────────────
 app.get('/admin/scheduled', requireAuth, requireAdmin, (req, res) => {
@@ -338,12 +396,15 @@ app.get('/admin/scheduled', requireAuth, requireAdmin, (req, res) => {
 });
 app.post('/admin/scheduled', requireAuth, requireAdmin, (req, res) => {
   const { username, target, company, cron, enabled } = req.body || {};
-  if (!username || !target || !company || !cron) return res.redirect('/admin/scheduled');
+  const host = normalizeTarget(target);
+  if (!username || !host || !company || !cron) return res.status(422).send(renderError('Username, company, cron, and one valid approved target are required.'));
+  if (req.body.authorizationConfirmed !== 'on') return res.status(403).send(renderError('Confirm authorization before scheduling a scan.'));
   const users = loadUsers();
   if (!users.find(u => u.username === username)) return res.redirect('/admin/scheduled');
+  if (!targetIsApprovedForUser(username, host)) return res.status(403).send(renderError('This target is not in the selected user\'s approved scan scope.'));
   const id = crypto.randomUUID();
   const scheduled = loadScheduled();
-  scheduled.push({ id, username, target, company, cron, enabled: enabled === 'on', createdAt: Date.now(), lastRun: null });
+  scheduled.push({ id, username, target: host, company, cron, enabled: enabled === 'on', authorizationConfirmed: true, authorizationConfirmedAt: new Date().toISOString(), createdAt: Date.now(), lastRun: null });
   saveScheduled(scheduled);
   res.redirect('/admin/scheduled');
 });
@@ -367,10 +428,13 @@ app.get('/scheduled', requireAuth, (req, res) => {
 });
 app.post('/scheduled', requireAuth, (req, res) => {
   const { target, company, cron, enabled } = req.body || {};
-  if (!target || !company || !cron) return res.redirect('/scheduled');
+  const host = normalizeTarget(target);
+  if (!host || !company || !cron) return res.status(422).send(renderError('Company, cron, and one valid approved target are required.'));
+  if (req.body.authorizationConfirmed !== 'on') return res.status(403).send(renderError('Confirm authorization before scheduling a scan.'));
+  if (!targetIsApprovedForUser(req.session.user.username, host)) return res.status(403).send(renderError('This target is not in your approved scan scope.'));
   const id = crypto.randomUUID();
   const scheduled = loadScheduled();
-  scheduled.push({ id, username: req.session.user.username, target, company, cron, enabled: enabled === 'on', createdAt: Date.now(), lastRun: null });
+  scheduled.push({ id, username: req.session.user.username, target: host, company, cron, enabled: enabled === 'on', authorizationConfirmed: true, authorizationConfirmedAt: new Date().toISOString(), createdAt: Date.now(), lastRun: null });
   saveScheduled(scheduled);
   res.redirect('/scheduled');
 });
@@ -410,50 +474,6 @@ app.post('/scan/:id/save-ip', requireAuth, (req, res) => {
   res.redirect('/scan/' + req.params.id);
 });
 
-function runScan(id, host) {
-  (async () => {
-    const out = { target: host, modules: {} };
-    try {
-      emitProgress(id, 'dns', 'active'); out.modules.dns = await scanners.dnsLookup(host, 'A'); emitProgress(id, 'dns', 'done');
-      emitProgress(id, 'subdomains', 'active'); out.modules.subdomains = await scanners.subdomainEnum(host); emitProgress(id, 'subdomains', 'done');
-      emitProgress(id, 'ports', 'active'); out.modules.ports = await scanners.portScanEnhanced(host, '21,22,25,53,80,110,143,443,445,8080,8443'); emitProgress(id, 'ports', 'done');
-      emitProgress(id, 'cve', 'active');
-      try {
-        const portData = out.modules.ports.ports || [];
-        out.modules.cve = await cveService.lookupCVEs(portData);
-        emitProgress(id, 'cve', 'done');
-      } catch (e) {
-        out.modules.cve = { error: e.message, totalVulnerabilities: 0, vulnerabilities: [], errors: [] };
-        emitProgress(id, 'cve', 'error');
-      }
-      emitProgress(id, 'headers', 'active'); out.modules.headers = await scanners.headerAnalysis(host); emitProgress(id, 'headers', 'done');
-      emitProgress(id, 'ssl', 'active'); out.modules.ssl = await scanners.sslScan(host, 443); emitProgress(id, 'ssl', 'done');
-      emitProgress(id, 'robots', 'active'); out.modules.robots = await scanners.robotsTxtFetch(host); emitProgress(id, 'robots', 'done');
-      try { emitProgress(id, 'whois', 'active'); out.modules.whois = await scanners.whoisLookup(host); emitProgress(id, 'whois', out.modules.whois.error ? 'error' : 'done'); } catch (e) { out.modules.whois = { error: e.message }; emitProgress(id, 'whois', 'error'); }
-      try { emitProgress(id, 'nmap', 'active'); out.modules.nmap = await scanners.nmapScan(host); emitProgress(id, 'nmap', out.modules.nmap.error ? 'error' : 'done'); } catch (e) { out.modules.nmap = { error: e.message }; emitProgress(id, 'nmap', 'error'); }
-      
-      // Generate OWASP compliance report
-      emitProgress(id, 'owasp', 'active');
-      try {
-        const scanData = {
-          cve: out.modules.cve,
-          headers: out.modules.headers,
-          ssl: out.modules.ssl
-        };
-        out.modules.owasp = owaspService.generateOWASPReport(scanData);
-        emitProgress(id, 'owasp', 'done');
-      } catch (e) {
-        out.modules.owasp = { error: e.message };
-        emitProgress(id, 'owasp', 'error');
-      }
-    } catch (e) { out.error = e.message; }
-    const all = loadScans();
-    const r = all.find(x => x.id === id);
-    if (r) { r.status = 'done'; r.results = out; r.finishedAt = Date.now(); saveScans(all); }
-    emitProgress(id, 'complete', 'done');
-  })();
-}
-
 // ── renderers (server-side HTML, external CSS) ──────────────────────────
 
 function renderRegister(err) {
@@ -486,6 +506,13 @@ function renderAdmin(user, users, opts = {}) {
         <form method="POST" action="/admin/${esc(u.username)}/reset-password" style="display:inline;margin-left:4px"><button class="ghost danger" type="submit">Reset PW</button></form>
       </td>
     </tr>`).join('');
+  const scopeEditors = users.map(u => `
+    <form class="card" method="POST" action="/admin/${encodeURIComponent(u.username)}/approved-targets" style="margin-top:16px">
+      <h2>Approved scan targets — ${esc(u.username)}</h2>
+      <p class="tag">One exact FQDN or IP address per line. Blank means scanning is denied. CIDR ranges are not accepted in this release.</p>
+      <textarea name="approvedTargets" rows="3" style="width:100%;box-sizing:border-box" placeholder="app.example.com&#10;203.0.113.10">${esc((u.approvedTargets || []).join('\n'))}</textarea>
+      <button type="submit" style="margin-top:10px">Save approved targets</button>
+    </form>`).join('');
   return shell('Admin Dashboard', `
 <header><h1>🌩️ ADMIN</h1>
 <div style="display:flex;align-items:center;gap:12px">
@@ -502,7 +529,7 @@ ${opts.resetMsg ? `<div class="scan-progress" style="background:rgba(63,185,80,0
     <th style="padding:8px">Role</th><th style="padding:8px">Status</th><th style="padding:8px">Actions</th>
   </tr></thead>
   <tbody>${list}</tbody>
-</table>`, { theme: 'dark' });
+</table>${scopeEditors}`, { theme: 'dark' });
 }
 
 function renderSaveIp(user, s) {
@@ -566,6 +593,7 @@ function renderAdminScheduled(user, scheduled) {
     <label>Company<input name="company" placeholder="Company Name" required/></label>
     <label>Cron (min hour dom month dow)<input name="cron" placeholder="0 2 * * *" required title="e.g. 0 2 * * * = daily at 2am"/></label>
     <label style="align-self:end"><input type="checkbox" name="enabled" checked/> Enabled</label>
+    <label style="grid-column:1/-1"><input type="checkbox" name="authorizationConfirmed" required/> I confirm this customer is authorized to scan this approved target.</label>
   </div>
   <button type="submit" style="margin-top:12px">Add</button>
 </form>
@@ -606,6 +634,7 @@ function renderUserScheduled(user, scheduled) {
     <label>Company<input name="company" value="${esc(user.company)}" required/></label>
     <label>Cron (min hour dom month dow)<input name="cron" placeholder="0 2 * * *" required title="e.g. 0 2 * * * = daily at 2am"/></label>
     <label style="align-self:end"><input type="checkbox" name="enabled" checked/> Enabled</label>
+    <label style="grid-column:1/-1"><input type="checkbox" name="authorizationConfirmed" required/> I confirm I am authorized to scan this approved target.</label>
   </div>
   <button type="submit" style="margin-top:12px">Add</button>
 </form>
@@ -712,8 +741,8 @@ function renderDashboard(user, scans) {
     <div class="summary-card ${active ? 'is-active' : ''}"><span class="summary-label">In progress</span><strong>${active}</strong><span>${active ? 'Live updates available' : 'Nothing running now'}</span></div>
     <div class="summary-card"><span class="summary-label">Completed</span><strong>${completed}</strong><span>${latest ? `Latest: ${esc(latest.target)}` : 'Ready when you are'}</span></div>
   </section>
-  <section class="launch-card"><div><p class="eyebrow">New assessment</p><h2>Run a scan</h2><p>Enter a host or domain to start an on-demand assessment.</p></div>
-    <form class="scanbox" method="POST" action="/scan"><input name="target" placeholder="example.com" aria-label="Target host"/><button type="submit">Start scan <span aria-hidden="true">→</span></button></form>
+  <section class="launch-card"><div><p class="eyebrow">New assessment</p><h2>Run a scan</h2><p>Enter an approved host or IP address to start an on-demand assessment.</p></div>
+    <form class="scanbox" method="POST" action="/scan"><input name="target" placeholder="example.com" aria-label="Approved target"/><label style="font-size:12px;display:flex;align-items:center;gap:6px"><input type="checkbox" name="authorizationConfirmed" required/> I am authorized</label><button type="submit">Start scan <span aria-hidden="true">→</span></button></form>
   </section>
   <section class="history-section"><div class="section-heading"><div><p class="eyebrow">History</p><h2>Recent scans</h2></div><span>${scans.length} total</span></div><div class="scan-list">${list}</div></section>
 </main>`, { theme: 'dark' });
@@ -881,6 +910,7 @@ function renderReport(s) {
   const started = new Date(s.startedAt).toLocaleString();
   const finished = s.finishedAt ? new Date(s.finishedAt).toLocaleString() : '—';
   const mods = (s.results && s.results.modules) ? s.results.modules : {};
+  const summary = createAssessmentSummary(s);
   
   // Render each module with smart formatting
   const modHtml = Object.entries(mods).map(([k, v]) => {
@@ -903,6 +933,12 @@ function renderReport(s) {
 <link rel="stylesheet" href="/style.css"/>
 <style>
   body.report-page{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .toolbar{padding:16px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border)} .page{max-width:960px;margin:0 auto;padding:28px}
+  .report-kicker{text-transform:uppercase;letter-spacing:.12em;font-size:.75rem;color:var(--muted);font-weight:700}
+  .executive-summary{display:grid;grid-template-columns:1.1fr 2fr;gap:18px;margin:26px 0;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--card)}
+  .risk-rating{font-size:2rem;font-weight:800;margin:4px 0}.risk-critical{color:#d9272e}.risk-high{color:#d36f00}.risk-medium{color:#9a7200}.risk-low{color:#237c48}.risk-informational{color:var(--muted)}
+  .severity-summary{display:flex;gap:10px;flex-wrap:wrap}.severity-summary span{padding:7px 9px;border-radius:999px;background:var(--bg);font-size:.85rem}.report-note{margin:18px 0;padding:14px;border-left:3px solid var(--accent);background:var(--card)}
+  .cve-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:.9rem}.cve-table th,.cve-table td{padding:9px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
   .report-section{margin:20px 0;padding:16px;border:1px solid var(--border);border-radius:8px}
   .report-section h2{margin-top:0;color:var(--accent)}
   .severity-critical{color:#ff4444;font-weight:bold}
@@ -915,11 +951,12 @@ function renderReport(s) {
   .asvs-pass{border-left:3px solid var(--ok)}
   .asvs-fail{border-left:3px solid var(--bad)}
   .wstg-test{margin:8px 0;padding:8px;background:var(--card)}
+  @media print{.toolbar{display:none}.page{max-width:none;padding:0}.executive-summary,.report-section{break-inside:avoid}}
 </style></head><body class="report-page">
   <div class="toolbar"><button onclick="window.print()">Print / Save as PDF</button></div>
   <div class="page">
     <header>
-      <h1>🌩️ T3MP3ST Scan Report</h1>
+      <div class="report-kicker">Authorized security assessment</div><h1>🌩️ T3MP3ST Scan Report</h1>
       <div class="meta">
         <div><strong>Target:</strong> ${esc(s.target)}</div>
         <div><strong>Company:</strong> ${esc(s.company || '—')}</div>
@@ -929,6 +966,12 @@ function renderReport(s) {
         <div><strong>Status:</strong> ${esc(s.status)}</div>
       </div>
     </header>
+    <section class="executive-summary">
+      <div><div class="report-kicker">Overall observed risk</div><div class="risk-rating risk-${summary.risk.toLowerCase()}">${esc(summary.risk)}</div><p class="meta">Based on known CVEs matched to observed service/version evidence. This is not a PCI compliance determination.</p></div>
+      <div><h2>Executive summary</h2><p>${summary.totalVulnerabilities ? `${summary.totalVulnerabilities} known CVE${summary.totalVulnerabilities === 1 ? '' : 's'} matched to observed services. Prioritize Critical and High items first, then validate remediation with a new authorized scan.` : 'No known CVEs were matched to the observed service/version evidence. Review the assessment limitations below before treating this as a clean result.'}</p><div class="severity-summary"><span><strong>${summary.counts.critical}</strong> Critical</span><span><strong>${summary.counts.high}</strong> High</span><span><strong>${summary.counts.medium}</strong> Medium</span><span><strong>${summary.counts.low}</strong> Low</span><span><strong>${summary.counts.unknown}</strong> Unscored</span></div></div>
+    </section>
+    <section class="report-note"><strong>Authorization and scope:</strong> ${summary.authorizationRecorded ? `The requester confirmed authorization for the exact server-approved target ${esc(s.scopeTarget)} at ${esc(new Date(s.authorizationConfirmedAt).toLocaleString())}.` : 'Authorization metadata was not recorded for this historical assessment.'}</section>
+    <section class="report-note"><strong>Assessment coverage:</strong> ${summary.checksCompleted} checks returned data.${summary.unavailableChecks.length ? ` The following checks were unavailable or incomplete: ${esc(summary.unavailableChecks.join(', '))}.` : ''} Results represent observed evidence at the recorded time and should be reviewed with the target owner.</section>
     ${modHtml || '<p>No module output.</p>'}
     <footer class="meta" style="margin-top:40px;border-top:1px solid var(--line);padding-top:12px">
       Generated by T3MP3ST Portal · ${esc(new Date().toLocaleString())}
@@ -953,17 +996,12 @@ function renderCVESection(cve) {
       </div>`;
   
   if (total > 0) {
-    html += '<h3 style="margin-top:20px">Top Vulnerabilities</h3>';
+    html += '<h3 style="margin-top:20px">Prioritized known vulnerabilities</h3><table class="cve-table"><thead><tr><th>Finding</th><th>CVSS</th><th>Affected service</th><th>Summary</th></tr></thead><tbody>';
     const topCVEs = (cve.vulnerabilities || []).slice(0, 10);
     topCVEs.forEach(vuln => {
-      html += `
-        <div class="cve-item">
-          <div><strong>${esc(vuln.cveId || 'Unknown CVE')}</strong> <span class="severity-${(vuln.severity || 'unknown').toLowerCase()}">[${esc(vuln.severity || 'UNKNOWN')}]</span></div>
-          <div><strong>Product:</strong> ${esc(vuln.product || 'Unknown')} ${vuln.version ? `v${esc(vuln.version)}` : ''}</div>
-          ${vuln.cvssScore ? `<div><strong>CVSS Score:</strong> ${vuln.cvssScore}</div>` : ''}
-          ${vuln.description ? `<div style="margin-top:6px;font-size:0.9em;color:var(--muted)">${esc(vuln.description.substring(0, 300))}${vuln.description.length > 300 ? '...' : ''}</div>` : ''}
-        </div>`;
+      html += `<tr><td><strong>${esc(vuln.cveId || 'Unknown')}</strong><br/><span class="severity-${(vuln.severity || 'unknown').toLowerCase()}">${esc(vuln.severity || 'UNKNOWN')}</span></td><td>${vuln.cvssScore != null ? esc(vuln.cvssScore) : 'Not scored'}</td><td>${esc(vuln.product || vuln.service || 'Unknown')} ${vuln.version ? `v${esc(vuln.version)}` : ''}${vuln.port ? `<br/>Port ${esc(vuln.port)}` : ''}</td><td>${esc((vuln.description || 'No description available.').substring(0, 300))}${(vuln.description || '').length > 300 ? '…' : ''}</td></tr>`;
     });
+    html += '</tbody></table>';
   }
   
   html += '</section>';
@@ -1027,4 +1065,4 @@ function renderOWASPSection(owasp) {
   return html;
 }
 
-app.listen(PORT, () => console.log(`T3MP3ST portal listening on :${PORT}`));
+app.listen(PORT, HOST, () => console.log(`T3MP3ST portal listening on ${HOST}:${PORT}`));

@@ -6,7 +6,9 @@
   "main": "src/server.js",
   "scripts": {
     "start": "pm2-runtime start ecosystem.config.js",
-    "dev": "node src/server.js"
+    "dev": "node src/server.js",
+    "test:scope": "node test-scope.js",
+    "test:report": "node test-report-summary.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
